@@ -45,7 +45,7 @@ param(
 
     [Parameter(Mandatory = $false, HelpMessage = "Existing Intune compliance policy display name to update.")]
     [ValidateNotNullOrEmpty()]
-    [string]$Windows11PolicyName,
+    [string]$Windows11PolicyName = 'Windows 11 Compliance', 
 
     [Parameter(Mandatory = $false, HelpMessage = "Create the Windows 11 compliance policy when Windows11PolicyName does not already exist. Default is false.")]
     [bool]$CreatePolicyIfMissing = $false,
@@ -136,7 +136,7 @@ param(
     [bool]$LogToDisk = $false,
 
     [Parameter(Mandatory = $false, HelpMessage = 'Path where Disk logs are saved (if LogToDisk is enabled)')]
-    [string]$LogToDiskPath = "$env:TEMP",
+    [string]$LogToDiskPath = "",
 
     [Parameter(Mandatory = $false, HelpMessage = "Enable verbose logging. Default is false")]
     [bool]$LogVerboseEnabled = $false,
@@ -153,8 +153,8 @@ param(
     [Parameter(Mandatory = $false, HelpMessage = "Save report to disk. Default is false")]
     [bool]$ReportToDisk = $false,
 
-    [Parameter(Mandatory = $false, HelpMessage = "Path where to save the report. Default is TEMP directory for Azure Automation compatibility")]
-    [string]$ReportToDiskPath = "$env:TEMP",
+    [Parameter(Mandatory = $false, HelpMessage = "Path where to save the report when ReportToDisk is enabled")]
+    [string]$ReportToDiskPath = "",
 # ==========> Throttling and Retry (Invoke-MgGraphRequestSingle) <=====================================================
     [Parameter(Mandatory = $false, HelpMessage = "Wait time in milliseconds between throttled requests. Default is 1000")]
     [ValidateRange(100, 5000)]
@@ -230,8 +230,8 @@ if ([string]::IsNullOrWhiteSpace($LogName)) { [string]$LogName = $ScriptActionNa
 if ([string]::IsNullOrWhiteSpace($ReportTitle)) { [string]$ReportTitle = $ScriptActionName }
 [string]$DefaultTempPath = [System.IO.Path]::GetTempPath()
 if ([string]::IsNullOrWhiteSpace($DefaultTempPath)) { $DefaultTempPath = '/tmp' }
-if ([string]::IsNullOrWhiteSpace($LogToDiskPath)) { $LogToDiskPath = $DefaultTempPath }
-if ([string]::IsNullOrWhiteSpace($ReportToDiskPath)) { $ReportToDiskPath = $DefaultTempPath }
+if ($LogToDisk -and [string]::IsNullOrWhiteSpace($LogToDiskPath)) { $LogToDiskPath = $DefaultTempPath }
+if ($ReportToDisk -and [string]::IsNullOrWhiteSpace($ReportToDiskPath)) { $ReportToDiskPath = $DefaultTempPath }
 [datetime]$ReportStartTime = ([DateTime]::Now)
 [hashtable]$ReportResults = @{}
 [scriptblock]$AddReport = {
@@ -447,12 +447,12 @@ function Invoke-TboneLog {
         [bool]$LogToEventlog = $true,
         [hashtable]$LogEventIds = @{Info = 11001; Warn = 11002; Error = 11003},
         [bool]$LogToHost = $true,
-        [bool]$LogToDisk = $true,
-        [string]$LogPath = "$env:TEMP"
+        [bool]$LogToDisk = $false,
+        [string]$LogPath = ""
     )
 
     if (!$LogMode) { $LogMode = if (Get-Variable -Name _l -Scope Global -EA 0) { 'Stop' } else { 'Start' } }
-    if (!$LogPath) {
+    if ($LogToDisk -and !$LogPath) {
         $ExistingLogPath = Get-Variable -Name _p -Scope Global -ValueOnly -ErrorAction SilentlyContinue
         $LogPath = if ($ExistingLogPath) { $ExistingLogPath } elseif ($env:TEMP) { $env:TEMP } else { '/tmp' }
     }
@@ -482,7 +482,7 @@ function Invoke-TboneLog {
         $global:_w = ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
         if (!(Test-Path function:\global:_Time)) { function global:_Time { Get-Date -f 'yyyy-MM-dd,HH:mm:ss' } }
         if (!(Test-Path function:\global:_ID)) { function global:_ID { $c = (Get-PSCallStack)[2]; $n = if ($c.Command -and $c.Command -ne '<ScriptBlock>') { $c.Command } elseif ($c.FunctionName -and $c.FunctionName -ne '<ScriptBlock>') { $c.FunctionName } else { 'Main-Script' }; if ($n -like '*.ps1') { 'Main-Script' } else { $n } } }
-        if (!(Test-Path function:\global:_Save)) { function global:_Save { try { if ($global:_d) { [IO.Directory]::CreateDirectory($global:_p) | Out-Null; [IO.File]::WriteAllLines((Join-Path $global:_p "$($global:_n).log"), $global:_l.ToArray()) }; if ($global:_e -and $global:_w) { $isAdmin = $false; try { $id = [Security.Principal.WindowsIdentity]::GetCurrent(); $isAdmin = ([Security.Principal.WindowsPrincipal]::new($id)).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator) } catch { }; $la = $global:_l -join "`n"; $h = $la -match ',ERROR,'; $et = if ($h) { 'Error' } elseif ($la -match ',WARN,') { 'Warning' } else { 'Information' }; $eid = if ($h) { $global:_i.Error } elseif ($la -match ',WARN,') { $global:_i.Warn } else { $global:_i.Info }; $ok = $false; try { Write-EventLog -LogName Application -Source $global:_s -EventId $eid -EntryType $et -Message $la -EA Stop; $ok = $true } catch { }; if (-not $ok -and $isAdmin) { try { [Diagnostics.EventLog]::CreateEventSource($global:_s, 'Application') } catch { }; try { Write-EventLog -LogName Application -Source $global:_s -EventId $eid -EntryType $et -Message $la } catch { } } } } catch { } } }
+        if (!(Test-Path function:\global:_Save)) { function global:_Save { try { if ($global:_d -and -not [string]::IsNullOrWhiteSpace($global:_p)) { [IO.Directory]::CreateDirectory($global:_p) | Out-Null; [IO.File]::WriteAllLines((Join-Path $global:_p "$($global:_n).log"), $global:_l.ToArray()) }; if ($global:_e -and $global:_w) { $isAdmin = $false; try { $id = [Security.Principal.WindowsIdentity]::GetCurrent(); $isAdmin = ([Security.Principal.WindowsPrincipal]::new($id)).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator) } catch { }; $la = $global:_l -join "`n"; $h = $la -match ',ERROR,'; $et = if ($h) { 'Error' } elseif ($la -match ',WARN,') { 'Warning' } else { 'Information' }; $eid = if ($h) { $global:_i.Error } elseif ($la -match ',WARN,') { $global:_i.Warn } else { $global:_i.Info }; $ok = $false; try { Write-EventLog -LogName Application -Source $global:_s -EventId $eid -EntryType $et -Message $la -EA Stop; $ok = $true } catch { }; if (-not $ok -and $isAdmin) { try { [Diagnostics.EventLog]::CreateEventSource($global:_s, 'Application') } catch { }; try { Write-EventLog -LogName Application -Source $global:_s -EventId $eid -EntryType $et -Message $la } catch { } } } } catch { } } }
         if (!(Test-Path function:\global:_Clean)) { function global:_Clean { $WhatIfPreference = $false; Remove-Item -Path function:\Write-Host, function:\Write-Output, function:\Write-Warning, function:\Write-Error, function:\Write-Verbose, function:\_Save, function:\_Clean, function:\_ID, function:\_Time -ea 0 -Force; Remove-Variable -Name _l, _g, _s, _n, _p, _d, _e, _i, _r, _w, _az -Scope Global -ea 0 } }
         $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { if ($global:_l) { try { _Save } catch { } }; if (Test-Path function:\_Clean) { _Clean } } -MaxTriggerCount 1
         function Script:Write-Host { $m = "$args"; $c = (Get-PSCallStack)[1]; $r = "Row$($c.ScriptLineNumber)"; $e = "$(_Time),INFO,$r,$(_ID),$m"; $global:_l.Add($e); if ($global:_g) { if ($global:_az) { Microsoft.PowerShell.Utility\Write-Output $m } else { Microsoft.PowerShell.Utility\Write-Host $e -ForegroundColor Green } } }
@@ -601,8 +601,7 @@ function Invoke-ScriptReport {
         [datetime]$ReportStartTime,
         [bool]$ReportDetailed = $false,
         [bool]$ReportToDisk = $false,
-        [ValidateScript({ Test-Path $_ -IsValid })]
-        [string]$ReportToDiskPath = "$env:TEMP\Reports",
+        [string]$ReportToDiskPath = "",
         [ValidateSet('JSON', 'CSV')]
         [string]$ReportFormat = 'CSV'
     )
@@ -650,6 +649,10 @@ function Invoke-ScriptReport {
         Write-Output "═══════════════════════════════════════════════════════════"
 
         if ($ReportToDisk) {
+            if ([string]::IsNullOrWhiteSpace($ReportToDiskPath)) {
+                [string]$BaseReportPath = if ($env:TEMP) { $env:TEMP } else { '/tmp' }
+                $ReportToDiskPath = Join-Path $BaseReportPath 'Reports'
+            }
             if (-not (Test-Path $ReportToDiskPath)) { New-Item -ItemType Directory -Path $ReportToDiskPath -Force -ErrorAction Stop | Out-Null }
             [string]$Timestamp = $ReportEndTime.ToString('yyyyMMdd_HHmmss')
             [string]$CleanAction = $ReportTitle -replace '[^\w\-]', '_'
