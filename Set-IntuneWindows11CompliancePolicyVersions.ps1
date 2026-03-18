@@ -103,7 +103,7 @@ param(
 
     [Parameter(HelpMessage = "Azure Key Vault name used to retrieve app authentication secrets before connecting to Microsoft Graph")]
     [ValidateNotNullOrEmpty()]
-    [string]$KeyVaultName = 'SharedAutomationKV',
+    [string]$KeyVaultName,
 
     [Parameter(HelpMessage = "Azure Key Vault secret name containing the Entra ID Tenant ID. Default is 'tenantid'")]
     [ValidateNotNullOrEmpty()]
