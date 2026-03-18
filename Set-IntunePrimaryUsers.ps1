@@ -1,11 +1,11 @@
 <#PSScriptInfo
-.VERSION        7.4.6
+.VERSION        7.5.1
 .GUID           feedbeef-beef-4dad-beef-000000000001
-.AUTHOR         @MrTbone_se (T-bone Granheden)
-.COPYRIGHT      (c) 2026 T-bone Granheden. MIT License - free to use with attribution.
+.AUTHOR         Internal
+.COPYRIGHT      (c) 2026
 .TAGS           Intune Graph PrimaryUser DeviceManagement MicrosoftGraph Azure
 .LICENSEURI     https://opensource.org/licenses/MIT
-.PROJECTURI     https://github.com/Mr-Tbone/Intune
+.PROJECTURI
 .RELEASENOTES
     1.0.2202.1 - Initial Version
     2.0.2312.1 - Large update to use Graph batching and reduce runtime
@@ -40,6 +40,10 @@
     7.4.4 2026-02-24 Fix AuthClientSecret
     7.4.5 2026-02-24 Fixed ClientSecret authentication without exposing secrets
     7.4.6 2026-03-02 Fix to support both secure and non secure secret string using object type
+    7.4.7 2026-03-12 Added optional Azure Key Vault secret retrieval for app authentication
+    7.4.8 2026-03-13 Added default Azure Key Vault secret names for tenantid, clientid and secret authentication values
+    7.5.0 2026-03-18 Added optional unauthenticated SMTP relay email reporting with summary body and CSV report attachment
+    7.5.1 2026-03-18 Simplified authentication inputs to Key Vault-backed app auth only for secret-based configuration
 #>
 
 <#
@@ -63,11 +67,20 @@
     .\Set-IntunePrimaryUsers.ps1 -OperatingSystems Windows -SignInsTimeSpan 7 -DeviceTimeSpan 7
     Sets primary user for Windows devices based on sign-ins and device activity in the last 7 days.
 
-.NOTES
-    Please feel free to use this, but make sure to credit @MrTbone_se as the original author
+.EXAMPLE
+    .\Set-IntunePrimaryUsers.ps1 -KeyVaultName 'kv-prod-intune'
+    Retrieves app authentication values from Azure Key Vault secret names 'tenantid', 'clientid' and 'secret' before connecting to Microsoft Graph.
 
-.LINK
-    https://tbone.se
+.EXAMPLE
+    .\Set-IntunePrimaryUsers.ps1 -KeyVaultName 'kv-prod-intune' -KeyVaultClientIdSecretName 'GraphClientId' -KeyVaultClientSecretSecretName 'GraphClientSecret' -KeyVaultTenantIdSecretName 'GraphTenantId'
+    Retrieves app authentication values from Azure Key Vault using custom secret names before connecting to Microsoft Graph.
+
+.EXAMPLE
+    .\Set-IntunePrimaryUsers.ps1 -EmailReportEnabled $true -EmailRelayServer 'mailrelay.contoso.com' -EmailRelayPort 25 -EmailFrom 'intune-report@contoso.com' -EmailTo 'helpdesk@contoso.com;endpoint-team@contoso.com'
+    Sends the report summary in the email body and attaches the full CSV report through an unauthenticated SMTP relay when the run finishes.
+ 
+.NOTES
+    Internal team script
 #>
 
 #region ---------------------------------------------------[Set Script Requirements]-----------------------------------------------
@@ -87,7 +100,7 @@ param(
     [string[]]$OperatingSystems     = @('Windows'),
         
     [Parameter(Mandatory = $false,          HelpMessage = "Filter Intune only managed devices (true) or also include Co-managed devices (false). Default is true")]
-    [bool]$IntuneOnly               = $true,
+    [bool]$IntuneOnly               = $false,
 
     [Parameter(Mandatory = $false,          HelpMessage = "Filter to only include devicenames that starts with specific strings like ('Tbone', 'Desktop'). Default is blank")]
     [string[]]$IncludedDeviceNames  = @(),
@@ -95,10 +108,10 @@ param(
     [Parameter(Mandatory = $false,          HelpMessage = "Filter to exclude devicenames that starts with specific strings like ('Tbone', 'Desktop'). Default is blank")]
     [string[]]$ExcludedDeviceNames  = @(),
 
-    [Parameter(Mandatory = $false,          HelpMessage = "Filter to exclude specific accounts as primary owners for example enrollment accounts ('wds@tbone.se','install@tbone.se'). Default is blank")]
+    [Parameter(Mandatory = $false,          HelpMessage = "Filter to exclude specific accounts as primary owners for example enrollment accounts ('setup@example.com','install@example.com'). Default is blank")]
     [string[]]$ReplaceUserAccounts  = @(),
 
-    [Parameter(Mandatory = $false,          HelpMessage = "Filter to keep specific accounts that always should be keept as primary owners ('Monitoring@tbone.se'). Default is blank")]
+    [Parameter(Mandatory = $false,          HelpMessage = "Filter to keep specific accounts that always should be keept as primary owners ('monitoring@example.com'). Default is blank")]
     [string[]]$KeepUserAccounts     = @(),
 
     [Parameter(Mandatory = $false,          HelpMessage = "Time period in days to retrieve user sign-in activity logs. Default is 30 days")]
@@ -111,33 +124,22 @@ param(
 
     [Parameter(Mandatory = $false,          HelpMessage = "Testmode, same as -WhatIf. Default is false")]
     [bool]$Testmode                 = $false,
-# ==========> Authentication (Invoke-ConnectMgGraph) Leave blank if use Interactive or Managed Identity <==============
-    [Parameter(                             HelpMessage = "Entra ID Tenant ID (directory ID) (required for Client Secret or Certificate authentication)")]
+# ==========> Authentication (Invoke-ConnectMgGraph) <============================================================================
+    [Parameter(                             HelpMessage = "Azure Key Vault name used to retrieve Microsoft Graph app authentication secrets before connecting")]
     [ValidateNotNullOrEmpty()]
-    [string]$AuthTenantId,
+    [string]$KeyVaultName = 'SharedAutomationKV',
 
-    [Parameter(                             HelpMessage = "Entra ID Application ID (ClientID) (required for Client Secret or Certificate authentication)")]
+    [Parameter(                             HelpMessage = "Azure Key Vault secret name containing the Entra ID Tenant ID. Default is 'tenantid'")]
     [ValidateNotNullOrEmpty()]
-    [string]$AuthClientId,
-    
-    [Parameter(                             HelpMessage = "Client Secret as SecureString or string for app-only authentication (require also ClientId and TenantId)")]
-    [ValidateNotNull()]
-    [Object]$AuthClientSecret, 
-    
-    [Parameter(                             HelpMessage = "Certificate thumbprint for certificate-based authentication (if certificate is stored in CurrentUser or LocalMachine store)")]
-    [ValidateNotNullOrEmpty()]
-    [string]$AuthCertThumbprint,
+    [string]$KeyVaultTenantIdSecretName = 'Intune-Automation-SP-tenantid',
 
-    [Parameter(                             HelpMessage = "Certificate subject name for certificate-based authentication (if certificate is stored in CurrentUser or LocalMachine store)")]
+    [Parameter(                             HelpMessage = "Azure Key Vault secret name containing the Entra ID Application ID (Client ID). Default is 'clientid'")]
     [ValidateNotNullOrEmpty()]
-    [string]$AuthCertName,
-    
-    [Parameter(                             HelpMessage = "File path to certificate (.pfx or .cer) for certificate-based authentication (if certificate is stored as a file)")]
+    [string]$KeyVaultClientIdSecretName = 'Intune-Automation-SP-clientid',
+
+    [Parameter(                             HelpMessage = "Azure Key Vault secret name containing the Entra ID Application Secret. Default is 'secret'")]
     [ValidateNotNullOrEmpty()]
-    [string]$AuthCertPath,
-    
-    [Parameter(                             HelpMessage = "Password for certificate file as SecureString (required if certificate is stored as a file and password-protected)")]
-    [SecureString]$AuthCertPassword,
+    [string]$KeyVaultClientSecretSecretName = 'Intune-Automation-SP-secret',
 # ==========> Logging (Invoke-TboneLog) <==============================================================================
     [Parameter(Mandatory = $false,          HelpMessage='Name of Log, to set name for Eventlog and Filelog')]
     [string]$LogName                = "",
@@ -177,6 +179,25 @@ param(
 
     [Parameter(Mandatory = $false,          HelpMessage = "Path where to save the report. Default is TEMP directory for Azure Automation compatibility")]
     [string]$ReportToDiskPath       = "$env:TEMP",
+
+    [Parameter(Mandatory = $false,          HelpMessage = "Send the report summary and CSV attachment by unauthenticated SMTP relay. Default is false")]
+    [bool]$EmailReportEnabled       = $false,
+
+    [Parameter(Mandatory = $false,          HelpMessage = "SMTP relay server used for unauthenticated report delivery")]
+    [string]$EmailRelayServer       = "emailserver.lac1.biz",
+
+    [Parameter(Mandatory = $false,          HelpMessage = "SMTP relay port used for unauthenticated report delivery. Default is 25")]
+    [ValidateRange(1,65535)]
+    [int]$EmailRelayPort            = 25,
+
+    [Parameter(Mandatory = $false,          HelpMessage = "Email sender address used for report delivery")]
+    [string]$EmailFrom              = "intunereports@spireenergy.com",
+
+    [Parameter(Mandatory = $false,          HelpMessage = "Recipient addresses used for report delivery. Separate multiple addresses with commas or semicolons")]
+    [string]$EmailTo                = "intunereports@spireenergy.com",
+
+    [Parameter(Mandatory = $false,          HelpMessage = "Optional email subject override. Defaults to report title with timestamp")]
+    [string]$EmailSubject           = "Intune Primary User Script Report",
 # ==========> Throttling and Retry (Invoke-MgGraphRequestSingle and Invoke-MgGraphRequestBatch) <======================
     [Parameter(Mandatory = $false,          HelpMessage = "Wait time in milliseconds between throttled requests. Default is 1000")]
     [ValidateRange(100,5000)]
@@ -206,9 +227,17 @@ param(
 
 #region ---------------------------------------------------[Set global script settings]--------------------------------------------
 # Exit if running as a managed identity in PowerShell 7.2 due to bugs connecting to MgGraph https://github.com/microsoftgraph/msgraph-sdk-powershell/issues/3151
-if ($env:IDENTITY_ENDPOINT -and $env:IDENTITY_HEADER -and $PSVersionTable.PSVersion -eq [version]"7.2.0") {
-    Write-Error "This script cannot run as a managed identity in PowerShell 7.2. Please use a different version of PowerShell."
-    exit 1}
+# Allow execution to continue only when Key Vault-backed app authentication is configured.
+[bool]$HasKeyVaultGraphAuthInput = -not [string]::IsNullOrWhiteSpace($KeyVaultName)
+if (
+    $env:IDENTITY_ENDPOINT -and
+    $env:IDENTITY_HEADER -and
+    $PSVersionTable.PSVersion -eq [version]"7.2.0" -and
+    -not $HasKeyVaultGraphAuthInput
+) {
+    Write-Error "This script cannot use Microsoft Graph managed identity authentication in PowerShell 7.2. Use a different PowerShell version or configure Key Vault-backed app authentication."
+    exit 1
+}
 # set strict mode to latest version
 Set-StrictMode -Version Latest
 
@@ -250,6 +279,7 @@ if([string]::IsNullOrWhiteSpace($LogName)) {[string]$LogName = $ScriptActionName
 if([string]::IsNullOrWhiteSpace($ReportTitle)) {[string]$ReportTitle = $ScriptActionName}   # Report title defaults to script action name
 [datetime]$ReportStartTime = ([DateTime]::Now)                                              # Script start time for reporting
 [hashtable]$ReportResults = @{}                                                             # Initialize empty hashtable for report results
+[object]$script:LastScriptReport = $null                                                   # Stores the latest structured report without changing normal stdout behavior
 [scriptblock]$AddReport = {param($Target,$OldValue,$NewValue,$Action,$Details)              # Small inline function to add report entries
     if(-not $ReportResults.ContainsKey($Action)){$ReportResults[$Action]=[System.Collections.ArrayList]::new()}
     $null=$ReportResults[$Action].Add([PSCustomObject]@{Target=$Target;OldValue=$OldValue;NewValue=$NewValue;Action=$Action;Details=$Details})}
@@ -263,64 +293,47 @@ function Invoke-ConnectMgGraph {
 .SYNOPSIS
     Connects to Microsoft Graph API with multiple authentication methods.
 .DESCRIPTION
-    Supports Managed Identity, Interactive, Client Secret, and Certificate authentication...
+    Supports Managed Identity, Interactive, and Client Secret authentication.
 .NOTES
-    Author:  @MrTbone_se (T-bone Granheden)
     Version: 2.0
     
     Version History:
     1.0 - Initial version
-    2.0 - 2026-01-09 - Changed parameter names and fixed minor bugs on certificate authentication
+    2.0 - 2026-01-09 - Changed parameter names and fixed minor bugs on authentication
     2.1 - 2026-02-24 - Fixed ClientSecret authentication PSCredential creation
     2.2 - 2026-03-01 - Fix to support both secure and non secure secret string using object type
+    2.3 - 2026-03-18 - Simplified to client secret, managed identity, and interactive authentication
 #>
     [CmdletBinding()]
     param (
         [Parameter(             HelpMessage = "Array of required Microsoft Graph API permission scopes example:('User.Read.All','DeviceManagementManagedDevices.ReadWrite.All') ")]
         [string[]]$RequiredScopes = @("User.Read.All"),
 
-        [Parameter(             HelpMessage = "Entra ID Tenant ID (directory ID) (required for Client Secret or Certificate authentication)")]
+        [Parameter(             HelpMessage = "Entra ID Tenant ID (directory ID) required for Client Secret authentication")]
         [ValidateNotNullOrEmpty()]
         [string]$AuthTenantId,
         
-        [Parameter(             HelpMessage = "Entra ID Application ID (ClientID) (required for Client Secret or Certificate authentication)")]
+        [Parameter(             HelpMessage = "Entra ID Application ID (ClientID) required for Client Secret authentication")]
         [ValidateNotNullOrEmpty()]
         [string]$AuthClientId, 
 
         [Parameter(             HelpMessage = "Client Secret as SecureString or stringfor app-only authentication (require also ClientId and TenantId)")]
         [ValidateNotNull()]
-        [Object]$AuthClientSecret,
-
-        [Parameter(             HelpMessage = "Certificate subject name for certificate-based authentication (if certificate is stored in CurrentUser or LocalMachine store)")]
-        [ValidateNotNullOrEmpty()]
-        [string]$AuthCertName,
-
-        [Parameter(             HelpMessage = "Certificate thumbprint for certificate-based authentication (if certificate is stored in CurrentUser or LocalMachine store)")]
-        [ValidateNotNullOrEmpty()]
-        [string]$AuthCertThumbprint,
-        
-        [Parameter(             HelpMessage = "File path to certificate (.pfx or .cer) for certificate-based authentication (if certificate is stored as a file)")]
-        [ValidateNotNullOrEmpty()]
-        [string]$AuthCertPath,
-        
-        [Parameter(             HelpMessage = "Password for certificate file as SecureString (required if certificate is stored as a file and password-protected)")]
-        [SecureString]$AuthCertPassword
+        [Object]$AuthClientSecret
     )
 
     Begin {
         $ErrorActionPreference = 'Stop'
         [string]$ResourceURL = "https://graph.microsoft.com/"
         
-        # Detect authentication method based on parameters and environment (priority: ClientSecret > Certificate > ManagedIdentity > Interactive)
+        # Detect authentication method based on parameters and environment (priority: ClientSecret > ManagedIdentity > Interactive)
         [bool]$HasClientId     = -not [string]::IsNullOrWhiteSpace($AuthClientId)
         [bool]$HasTenantId     = -not [string]::IsNullOrWhiteSpace($AuthTenantId)
         [bool]$HasClientSecret = $null -ne $AuthClientSecret
-        [bool]$HasCertInput    = -not [string]::IsNullOrWhiteSpace($AuthCertThumbprint) -or -not [string]::IsNullOrWhiteSpace($AuthCertName) -or -not [string]::IsNullOrWhiteSpace($AuthCertPath)
 
         [string]$AuthMethod = if ($HasClientSecret -and $HasClientId -and $HasTenantId) {'ClientSecret'}
-        elseif ($HasCertInput -and $HasClientId -and $HasTenantId)                      {'Certificate'}
-        elseif ($env:IDENTITY_ENDPOINT -and $env:IDENTITY_HEADER)                       {'ManagedIdentity'}
-        else                                                                            {'Interactive'}
+        elseif ($env:IDENTITY_ENDPOINT -and $env:IDENTITY_HEADER)                    {'ManagedIdentity'}
+        else                                                                         {'Interactive'}
         Write-Verbose "Using authentication method: $AuthMethod"
     }
 
@@ -403,63 +416,6 @@ function Invoke-ConnectMgGraph {
                     Write-Verbose "Using ClientId: $AuthClientId, TenantId: $AuthTenantId"
                 }
                 
-                'Certificate' {
-                    Write-Verbose "Connecting with Certificate"
-                    # Validate required inputs
-                    if (-not $HasClientId -or -not $HasTenantId) {
-                        throw "Certificate authentication requires both ClientId and TenantId."
-                    }
-                    $ConnectParams['ClientId'] = $AuthClientId
-                    $ConnectParams['TenantId'] = $AuthTenantId
-                    
-                    # Handle different certificate input methods
-                    if ($AuthCertThumbprint) {
-                        $ConnectParams['CertificateThumbprint'] = $AuthCertThumbprint
-                        Write-Verbose "Using certificate thumbprint: $AuthCertThumbprint"
-                    }
-                    elseif ($AuthCertName) {
-                        $ConnectParams['CertificateName'] = $AuthCertName
-                        Write-Verbose "Using certificate name: $AuthCertName"
-                    }
-                    elseif ($AuthCertPath) {
-                        # Load certificate from file
-                        if (-not (Test-Path $AuthCertPath)) {
-                            throw "Certificate file not found: $AuthCertPath"
-                        }
-                        
-                        try {
-                            # Declare variable for StrictMode compliance
-                            [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert = $null
-                            # Use MachineKeySet flag for Azure Automation compatibility
-                            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]$KeyFlags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::MachineKeySet
-                            
-                            if ($AuthCertPassword) {
-                                $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-                                    $AuthCertPath, 
-                                    $AuthCertPassword,
-                                    $KeyFlags
-                                )
-                            } else {
-                                $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($AuthCertPath, [string]::Empty, $KeyFlags)
-                            }
-                            
-                            # Validate certificate has private key (required for auth)
-                            if (-not $Cert.HasPrivateKey) {
-                                throw "Certificate does not contain a private key, which is required for authentication"
-                            }
-                            
-                            $ConnectParams['Certificate'] = $Cert
-                            Write-Verbose "Loaded certificate from: $AuthCertPath (Subject: $($Cert.Subject), Expires: $($Cert.NotAfter))"
-                        }
-                        catch {
-                            throw "Failed to load certificate: $($_.Exception.Message)"
-                        }
-                    }
-                    else {
-                        throw "No certificate specified. Use CertificateThumbprint, CertificateName, or CertificatePath"
-                    }
-                }
-                
                 'Interactive' {
                     Write-Verbose "Connecting interactively"
                     # Ensure scopes are a string array
@@ -518,6 +474,118 @@ function Invoke-ConnectMgGraph {
         Write-Verbose "Function finished. Memory usage: $MemoryUsage MB"
     }
 }
+function Invoke-GetKeyVaultSecretValue {
+<#
+.SYNOPSIS
+    Retrieves a plain text secret value from Azure Key Vault.
+.DESCRIPTION
+    Uses Az.KeyVault when available. If Az modules are not available, it falls back to the managed identity endpoint
+    when the script is running with a managed identity in Azure.
+.NOTES
+    Version: 1.0
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, HelpMessage = "Azure Key Vault name")]
+        [ValidateNotNullOrEmpty()]
+        [string]$VaultName,
+
+        [Parameter(Mandatory = $true, HelpMessage = "Azure Key Vault secret name")]
+        [ValidateNotNullOrEmpty()]
+        [string]$SecretName
+    )
+
+    begin {
+        $ErrorActionPreference = 'Stop'
+    }
+
+    process {
+        try {
+            if (Get-Command -Name Get-AzKeyVaultSecret -ErrorAction SilentlyContinue) {
+                [bool]$UseAzKeyVault = $true
+                Write-Verbose "Retrieving secret '$SecretName' from Key Vault '$VaultName' using Az.KeyVault when available"
+
+                if (-not (Get-Command -Name Get-AzContext -ErrorAction SilentlyContinue)) {
+                    if ($env:IDENTITY_ENDPOINT -and $env:IDENTITY_HEADER) {
+                        Write-Verbose "Az.Accounts is missing. Falling back to managed identity REST for Key Vault access."
+                        $UseAzKeyVault = $false
+                    }
+                    else {
+                        throw "Az.KeyVault is available, but Az.Accounts is missing. Install Az.Accounts or run with managed identity fallback."
+                    }
+                }
+
+                if ($UseAzKeyVault) {
+                    [object]$AzContext = Get-AzContext -ErrorAction SilentlyContinue
+                    if (-not $AzContext) {
+                        if (Get-Command -Name Connect-AzAccount -ErrorAction SilentlyContinue) {
+                            if ($env:IDENTITY_ENDPOINT -and $env:IDENTITY_HEADER) {
+                                Write-Verbose "No Azure context found. Connecting to Azure with managed identity for Key Vault access."
+                                Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+                            }
+                            else {
+                                throw "No Azure context found for Key Vault access. Run Connect-AzAccount first or execute the script with a managed identity."
+                            }
+                        }
+                        elseif ($env:IDENTITY_ENDPOINT -and $env:IDENTITY_HEADER) {
+                            Write-Verbose "Connect-AzAccount is unavailable. Falling back to managed identity REST for Key Vault access."
+                            $UseAzKeyVault = $false
+                        }
+                        else {
+                            throw "Az.Accounts cmdlets are not available. Install Az.Accounts or use managed identity fallback."
+                        }
+                    }
+                }
+
+                if ($UseAzKeyVault) {
+                    [object]$Secret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop
+                    if ($Secret.PSObject.Properties.Name -contains 'SecretValueText' -and -not [string]::IsNullOrWhiteSpace([string]$Secret.SecretValueText)) {
+                        return [string]$Secret.SecretValueText
+                    }
+
+                    if ($Secret.SecretValue) {
+                        $Bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secret.SecretValue)
+                        try {
+                            return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($Bstr)
+                        }
+                        finally {
+                            if ($Bstr -ne [IntPtr]::Zero) {
+                                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Bstr)
+                            }
+                        }
+                    }
+
+                    throw "Secret '$SecretName' in Key Vault '$VaultName' is empty."
+                }
+            }
+
+            if ($env:IDENTITY_ENDPOINT -and $env:IDENTITY_HEADER) {
+                Write-Verbose "Retrieving secret '$SecretName' from Key Vault '$VaultName' using managed identity REST fallback"
+                [string]$VaultResource = "https://vault.azure.net"
+                [hashtable]$Headers = @{
+                    'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER
+                    'Metadata'          = 'True'
+                }
+                [object]$TokenResponse = Invoke-RestMethod -Uri "$($env:IDENTITY_ENDPOINT)?resource=$VaultResource" -Method GET -Headers $Headers -TimeoutSec 30 -ErrorAction Stop
+                if (-not $TokenResponse -or [string]::IsNullOrWhiteSpace($TokenResponse.access_token)) {
+                    throw "Failed to retrieve an Azure Key Vault access token from the managed identity endpoint."
+                }
+
+                [string]$SecretUri = "https://$VaultName.vault.azure.net/secrets/$SecretName?api-version=7.4"
+                [object]$SecretResponse = Invoke-RestMethod -Uri $SecretUri -Method GET -Headers @{ Authorization = "Bearer $($TokenResponse.access_token)" } -TimeoutSec 30 -ErrorAction Stop
+                if (-not $SecretResponse -or [string]::IsNullOrWhiteSpace($SecretResponse.value)) {
+                    throw "Secret '$SecretName' in Key Vault '$VaultName' is empty."
+                }
+                return $SecretResponse.value
+            }
+
+            throw "Azure Key Vault retrieval requires either Az.KeyVault/Az.Accounts with a valid Azure context or execution with a managed identity."
+        }
+        catch {
+            throw "Failed to retrieve secret '$SecretName' from Key Vault '$VaultName': $($_.Exception.Message)"
+        }
+    }
+}
 function Invoke-TboneLog { 
 <#
 .SYNOPSIS
@@ -527,7 +595,6 @@ function Invoke-TboneLog {
     Write-Warning, and Write-Error calls. Stores messages in memory with timestamps and can optionally output to:
     -LogToGUI - Console (real-time during execution) -LogToDisk - Disk (log file at script completion) -LogToEventlog - Windows Event Log (Application log)
 .NOTES
-    Author:  @MrTbone_se (T-bone Granheden)
     Version: 1.1.0
     
     Version History:
@@ -557,10 +624,17 @@ function Invoke-TboneLog {
     )
     # Auto-detect mode: if logger functions is already loaded in memory and no mode specified, assume Stop
     if(!$LogMode){$LogMode=if(Get-Variable -Name _l -Scope Global -EA 0){'Stop'}else{'Start'}}
-    if(!$LogPath){$LogPath=if($global:_p){$global:_p}elseif($env:TEMP){$env:TEMP}else{'/tmp'}}
+    if(!$LogPath){
+        $ExistingLogPath = Get-Variable -Name _p -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        $LogPath = if($ExistingLogPath){$ExistingLogPath}elseif($env:TEMP){$env:TEMP}else{'/tmp'}
+    }
     # Stop mode: Save logs and cleanup
     if ($LogMode -eq 'Stop') {
-        if((Get-Variable -Name _l -Scope Global -EA 0) -and (Test-Path function:\global:_Save)){_Save;if($global:_r){,$global:_l.ToArray()}}
+        if((Get-Variable -Name _l -Scope Global -EA 0) -and (Test-Path function:\global:_Save)){
+            _Save
+            $ReturnLogsToHost = Get-Variable -Name _r -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+            if($ReturnLogsToHost){,$global:_l.ToArray()}
+        }
         Unregister-Event -SourceIdentifier PowerShell.Exiting -ea 0 -WhatIf:$false
         if(Test-Path function:\global:_Clean){_Clean}
         return
@@ -593,7 +667,6 @@ function Invoke-MgGraphRequestSingle {
     Supports filtering, property selection, and count queries. Returns all pages of results automatically.
     Handles skip token expiration by restarting query with smaller page size and deduplication.
 .NOTES
-    Author:  @MrTbone_se (T-bone Granheden)
     Version: 2.2
     
     Version History:
@@ -899,7 +972,6 @@ function Invoke-MgGraphRequestBatch {
     Sends Graph API requests in batches (up to 20 per batch) to efficiently process large numbers of objects.
     Handles throttling, retries, and provides progress tracking. Supports GET, PATCH, POST, and DELETE operations.
 .NOTES
-    Author:  @MrTbone_se (T-bone Granheden)
     Version: 1.3
     
     Version History:
@@ -1215,7 +1287,6 @@ function Convert-PSObjectArrayToHashTables {
     Creates Generic.Dictionary hashtables from PSObject arrays using specified properties as keys.
     Returns single or multiple hashtables indexed by property values for efficient data retrieval.
 .NOTES
-    Author:  @MrTbone_se (T-bone Granheden)
     Version: 1.2
     
     Version History:
@@ -1346,51 +1417,40 @@ function Convert-PSObjectArrayToHashTables {
 function Invoke-ScriptReport {
 <#
 .SYNOPSIS
-    A reporting function with dynamic action tracking that generates a summary and detailed report.
+    Generates a report summary, detailed data, and optional exports for script execution.
 .DESCRIPTION
-    Generates comprehensive reports with dynamic action counters. Tracks Target, OldValue, NewValue, 
-    and Action for each processed object. Compatible with PS 5.1-7.5 and Azure Automation.
-    Initialize hashtable and a small helper inline function for reporting function (invoke-scriptreport)
-        [hashtable]$ReportResults = @{}
-        [scriptblock]$addReport = {param($Target,$OldValue,$NewValue,$Action,$Details)
-            if(-not $ReportResults.ContainsKey($Action)){$ReportResults[$Action]=[System.Collections.ArrayList]::new()}
-            $null=$ReportResults[$Action].Add([PSCustomObject]@{Target=$Target;OldValue=$OldValue;NewValue=$NewValue;Action=$Action;Details=$Details})}
-    Then use this to log report actions during processing:
-        & $addReport -Target "Device001" -OldValue "Enabled" -NewValue "Disabled" -Action "Disabled" -Details "Optional info"
+    Builds a reusable report object from the collected action results. The function can emit the report to the
+    console/log stream, export it to disk, and return a structured object for downstream handling such as email.
 .NOTES
-    Author:  @MrTbone_se (T-bone Granheden)
-    Version: 2.0
-    
-    Version History:
-    1.0 - Initial version
-    2.0 - Added dynamic reporting object with dynamic action counters
-    2.1 - renamed parameter ActionName to ReportTitle for clarity
-    2.2 - Added %% to avoid formatting issues with percentage values
+    Version: 3.0
 #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $false,                  HelpMessage = "Description of the action performed by the script")]
-        [string]$ReportTitle           = "Script Execution Report",
-        
-        [Parameter(Mandatory = $true,                   HelpMessage = "Hashtable of ArrayLists grouped by Action containing report entries")]
+        [Parameter(Mandatory = $false, HelpMessage = "Description of the action performed by the script")]
+        [string]$ReportTitle = "Script Execution Report",
+
+        [Parameter(Mandatory = $true, HelpMessage = "Hashtable of ArrayLists grouped by Action containing report entries")]
         [hashtable]$ReportResults,
-        
-        [Parameter(Mandatory = $true,                   HelpMessage = "Start time of the report execution")]
+
+        [Parameter(Mandatory = $true, HelpMessage = "Start time of the report execution")]
         [datetime]$ReportStartTime,
 
-        [Parameter(Mandatory = $false,                  HelpMessage = "Include detailed per-object results in console output")]
-        [bool]$ReportDetailed           = $false,
+        [Parameter(Mandatory = $false, HelpMessage = "Include detailed per-object results in console output")]
+        [bool]$ReportDetailed = $false,
 
-        [Parameter(Mandatory = $false,                  HelpMessage = "Save report to disk in JSON/CSV format")]
-        [bool]$ReportToDisk             = $false,
+        [Parameter(Mandatory = $false, HelpMessage = "Save report to disk in JSON/CSV format")]
+        [bool]$ReportToDisk = $false,
 
-        [Parameter(Mandatory = $false,                  HelpMessage = "Directory path where report files will be saved")]
+        [Parameter(Mandatory = $false, HelpMessage = "Directory path where report files will be saved")]
         [ValidateScript({Test-Path $_ -IsValid})]
-        [string]$ReportToDiskPath       = "$env:TEMP\Reports",
-        
-        [Parameter(Mandatory = $false,                  HelpMessage = "Format for report export (JSON or CSV)")]
+        [string]$ReportToDiskPath = "$env:TEMP\Reports",
+
+        [Parameter(Mandatory = $false, HelpMessage = "Format for report export (JSON or CSV)")]
         [ValidateSet('JSON', 'CSV')]
-        [string]$ReportFormat           = 'CSV'
+        [string]$ReportFormat = 'CSV',
+
+        [Parameter(Mandatory = $false, HelpMessage = "Emit report output to the console/log stream")]
+        [bool]$ReportEmitOutput = $true
     )
 
     Begin {
@@ -1400,14 +1460,10 @@ function Invoke-ScriptReport {
 
     Process {
         try {
-            # Calculate duration
             [timespan]$Duration = $ReportEndTime - $ReportStartTime
             [string]$DurationFormatted = $Duration.ToString("hh\:mm\:ss")
-            
-            # Cache sorted action keys
             [array]$SortedActions = @($ReportResults.Keys | Sort-Object)
-            
-            # Build action summary and count total objects
+
             [int]$TotalObjects = 0
             [System.Collections.Specialized.OrderedDictionary]$ActionSummary = [ordered]@{}
             foreach ($Action in $SortedActions) {
@@ -1415,118 +1471,130 @@ function Invoke-ScriptReport {
                 $ActionSummary[$Action] = $Count
                 $TotalObjects += $Count
             }
-            # Output detailed report if requested
-            if ($ReportDetailed -and $TotalObjects -gt 0) {
-                # Flatten all entries from all action groups into a single array
-                [System.Collections.ArrayList]$AllEntries = [System.Collections.ArrayList]::new($TotalObjects)
-                foreach ($Action in $SortedActions) {
-                    [void]$AllEntries.AddRange(@($ReportResults[$Action]))
+
+            [System.Collections.ArrayList]$AllEntries = [System.Collections.ArrayList]::new()
+            foreach ($Action in $SortedActions) {
+                [void]$AllEntries.AddRange(@($ReportResults[$Action]))
+            }
+            [array]$SortedEntries = @($AllEntries | Sort-Object -Property Action, Target)
+
+            [System.Collections.Generic.List[string]]$SummaryLines = [System.Collections.Generic.List[string]]::new()
+            $SummaryLines.Add("Report: $ReportTitle")
+            $SummaryLines.Add("Start: $($ReportStartTime.ToString('yyyy-MM-dd HH:mm:ss'))")
+            $SummaryLines.Add("End: $($ReportEndTime.ToString('yyyy-MM-dd HH:mm:ss'))")
+            $SummaryLines.Add("Duration: $DurationFormatted")
+            $SummaryLines.Add("Summary:")
+            if ($ActionSummary.Count -gt 0) {
+                foreach ($Action in $ActionSummary.Keys) {
+                    [int]$Count = $ActionSummary[$Action]
+                    [double]$Percentage = if ($TotalObjects -gt 0) { [math]::Round(($Count / $TotalObjects) * 100, 1) } else { 0 }
+                    $SummaryLines.Add("  ${Action}: $Count ($Percentage%)")
                 }
-                # Sort entries and output each line to avoid truncation
-                [array]$SortedEntries = @($AllEntries | Sort-Object -Property Action, Target)
+            }
+            else {
+                $SummaryLines.Add("  No actions recorded")
+            }
+            $SummaryLines.Add("Total Objects: $TotalObjects")
+
+            if ($ReportEmitOutput -and $ReportDetailed -and $TotalObjects -gt 0) {
                 [object]$TableOutput = $SortedEntries | Format-Table -Property `
                     @{Name='Target';Expression={$_.Target};Alignment='Left'},
                     @{Name='OldValue';Expression={$_.OldValue};Alignment='Left'},
                     @{Name='NewValue';Expression={$_.NewValue};Alignment='Left'},
                     @{Name='Action';Expression={$_.Action};Alignment='Left'},
                     @{Name='Details';Expression={$_.Details};Alignment='Left'} -AutoSize -Wrap
-                # Use Out-String with -Stream to output each line separately (no truncation)
                 $TableOutput | Out-String -Stream -Width 250 | ForEach-Object { Write-Output $_ }
             }
-            #Output summary report
-            Write-Output "═══════════════════════════════════════════════════════════"
-            Write-Output "  $ReportTitle"
-            Write-Output "═══════════════════════════════════════════════════════════"
-            Write-Output "  Start:    $($ReportStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-            Write-Output "  End:      $($ReportEndTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-            Write-Output "  Duration: $DurationFormatted"
-            Write-Output "───────────────────────────────────────────────────────────"
-            Write-Output "  Summary"
-            
-            # Display actions breakdown dynamically and their percentages
-            if ($ActionSummary.Count -gt 0) {
-                if ($TotalObjects -gt 0) {
+
+            if ($ReportEmitOutput) {
+                Write-Output "═══════════════════════════════════════════════════════════"
+                Write-Output "  $ReportTitle"
+                Write-Output "═══════════════════════════════════════════════════════════"
+                Write-Output "  Start:    $($ReportStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+                Write-Output "  End:      $($ReportEndTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+                Write-Output "  Duration: $DurationFormatted"
+                Write-Output "───────────────────────────────────────────────────────────"
+                Write-Output "  Summary"
+                if ($ActionSummary.Count -gt 0) {
                     foreach ($Action in $ActionSummary.Keys) {
                         [int]$Count = $ActionSummary[$Action]
-                        [double]$Percentage = [math]::Round(($Count / $TotalObjects) * 100, 1)
-                        Write-Output ("    {0,-30}: {1,6} ({2,5}%%)" -f $Action, $Count, $Percentage)
-                    }
-                } else {
-                    foreach ($Action in $ActionSummary.Keys) {
-                        Write-Output ("    {0,-20}: {1,6} (  0.0%%)" -f $Action, $ActionSummary[$Action])
+                        [double]$Percentage = if ($TotalObjects -gt 0) { [math]::Round(($Count / $TotalObjects) * 100, 1) } else { 0 }
+                        Write-Output (("    {0,-30}: {1,6} ({2,5}" -f $Action, $Count, $Percentage) + '%)')
                     }
                 }
+                Write-Output ("    {0,-30}: {1,6}" -f "Total Objects", $TotalObjects)
+                Write-Output "═══════════════════════════════════════════════════════════"
             }
-            Write-Output ("    {0,-30}: {1,6}" -f "Total Objects", $TotalObjects)
-            Write-Output "═══════════════════════════════════════════════════════════"
 
+            [string]$SavedReportPath = $null
             if ($ReportToDisk) {
-                # Ensure directory exists or create it
                 if (-not (Test-Path $ReportToDiskPath)) {
-                    try {New-Item -ItemType Directory -Path $ReportToDiskPath -Force -ErrorAction Stop | Out-Null}
+                    try { New-Item -ItemType Directory -Path $ReportToDiskPath -Force -ErrorAction Stop | Out-Null }
                     catch {
                         Write-Warning "Failed to create report directory '$ReportToDiskPath': $($_.Exception.Message)"
                         Write-Warning "Report will not be saved to disk."
-                        return
                     }
                 }
-                # Build base filename
-                [string]$Timestamp = $ReportEndTime.ToString('yyyyMMdd_HHmmss')
-                [string]$CleanAction = $ReportTitle -replace '[^\w\-]', '_'
-                [string]$BaseFileName = "Report_$($CleanAction)_$Timestamp"
-                
-                # Save report based on format parameter
-                if ($ReportFormat -eq 'JSON') {
-                    # Flatten results for JSON export
-                    $AllResults = [System.Collections.ArrayList]::new()
-                    foreach ($List in $ReportResults.Values) {
-                        [void]$AllResults.AddRange($List)
-                    }
-                    
-                    # Build report object
-                    $ReportData = [PSCustomObject]@{
-                        ReportTitle    = $ReportTitle
-                        StartTime       = $ReportStartTime.ToString('yyyy-MM-dd HH:mm:ss')
-                        EndTime         = $ReportEndTime.ToString('yyyy-MM-dd HH:mm:ss')
-                        Duration        = $DurationFormatted
-                        TotalProcessed  = $TotalObjects
-                        ActionSummary   = $ActionSummary
-                        DetailedResults = $AllResults
-                    }
-                    
-                    # Save as JSON
-                    try {
-                        $ReportToDiskPath = Join-Path $ReportToDiskPath "$BaseFileName.json"
-                        $ReportData | ConvertTo-Json -Depth 10 -Compress:$false | Out-File -FilePath $ReportToDiskPath -Force -Encoding utf8 -ErrorAction Stop
-                        Write-Output "Report saved: $ReportToDiskPath"
-                    }
-                    catch {
-                        Write-Warning "Failed to save JSON report: $($_.Exception.Message)"
-                    }
-                }
-                else {
-                    # Save as CSV
-                    if ($ReportResults.Count -gt 0) {
-                        # Flatten results for CSV export
-                        $AllResults = [System.Collections.ArrayList]::new()
-                        foreach ($List in $ReportResults.Values) {
-                            [void]$AllResults.AddRange($List)
+
+                if (Test-Path $ReportToDiskPath) {
+                    [string]$Timestamp = $ReportEndTime.ToString('yyyyMMdd_HHmmss')
+                    [string]$CleanAction = $ReportTitle -replace '[^\w\-]', '_'
+                    [string]$BaseFileName = "Report_$($CleanAction)_$Timestamp"
+
+                    if ($ReportFormat -eq 'JSON') {
+                        [PSCustomObject]$ReportData = [PSCustomObject]@{
+                            ReportTitle     = $ReportTitle
+                            StartTime       = $ReportStartTime.ToString('yyyy-MM-dd HH:mm:ss')
+                            EndTime         = $ReportEndTime.ToString('yyyy-MM-dd HH:mm:ss')
+                            Duration        = $DurationFormatted
+                            TotalProcessed  = $TotalObjects
+                            ActionSummary   = $ActionSummary
+                            DetailedResults = $SortedEntries
                         }
-                        
+
                         try {
-                            $ReportToDiskPath = Join-Path $ReportToDiskPath "$BaseFileName.csv"
-                            $AllResults | Export-Csv -Path $ReportToDiskPath -NoTypeInformation -Force -Encoding UTF8 -ErrorAction Stop
-                            Write-Output "Report saved: $ReportToDiskPath"
+                            $SavedReportPath = Join-Path $ReportToDiskPath "$BaseFileName.json"
+                            $ReportData | ConvertTo-Json -Depth 10 -Compress:$false | Out-File -FilePath $SavedReportPath -Force -Encoding utf8 -ErrorAction Stop
+                            if ($ReportEmitOutput) { Write-Output "Report saved: $SavedReportPath" }
                         }
                         catch {
-                            Write-Warning "Failed to save CSV report: $($_.Exception.Message)"
+                            Write-Warning "Failed to save JSON report: $($_.Exception.Message)"
+                            $SavedReportPath = $null
                         }
                     }
                     else {
-                        Write-Warning "No results to save in CSV format."
+                        try {
+                            $SavedReportPath = Join-Path $ReportToDiskPath "$BaseFileName.csv"
+                            if ($SortedEntries.Count -gt 0) {
+                                $SortedEntries | Export-Csv -Path $SavedReportPath -NoTypeInformation -Force -Encoding UTF8 -ErrorAction Stop
+                            }
+                            else {
+                                [System.IO.File]::WriteAllText($SavedReportPath, "Target,OldValue,NewValue,Action,Details`r`n", [System.Text.Encoding]::UTF8)
+                            }
+                            if ($ReportEmitOutput) { Write-Output "Report saved: $SavedReportPath" }
+                        }
+                        catch {
+                            Write-Warning "Failed to save CSV report: $($_.Exception.Message)"
+                            $SavedReportPath = $null
+                        }
                     }
                 }
             }
+
+            [PSCustomObject]$ReportObject = [PSCustomObject]@{
+                ReportTitle     = $ReportTitle
+                StartTime       = $ReportStartTime
+                EndTime         = $ReportEndTime
+                Duration        = $DurationFormatted
+                TotalProcessed  = $TotalObjects
+                ActionSummary   = $ActionSummary
+                DetailedResults = $SortedEntries
+                SummaryLines    = $SummaryLines.ToArray()
+                SummaryText     = ($SummaryLines.ToArray() -join [Environment]::NewLine)
+                SavedReportPath = $SavedReportPath
+            }
+
+            $script:LastScriptReport = $ReportObject
             Write-Verbose "Report completed successfully"
         }
         catch {
@@ -1536,9 +1604,98 @@ function Invoke-ScriptReport {
     }
 
     End {
-        # End function and report memory usage 
         [double]$MemoryUsage = [Math]::Round(([System.GC]::GetTotalMemory($false) / 1MB), 2)
         Write-Verbose "Function finished. Memory usage: $MemoryUsage MB"
+    }
+}
+function Invoke-SendSmtpReport {
+<#
+.SYNOPSIS
+    Sends a report summary and attachment through an unauthenticated SMTP relay.
+.DESCRIPTION
+    Builds a plain text email message and sends it without SMTP authentication.
+.NOTES
+    Version: 1.0
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, HelpMessage = "SMTP relay host")]
+        [ValidateNotNullOrEmpty()]
+        [string]$SmtpServer,
+
+        [Parameter(Mandatory = $false, HelpMessage = "SMTP relay port")]
+        [ValidateRange(1,65535)]
+        [int]$SmtpPort = 25,
+
+        [Parameter(Mandatory = $true, HelpMessage = "Sender email address")]
+        [ValidateNotNullOrEmpty()]
+        [string]$From,
+
+        [Parameter(Mandatory = $true, HelpMessage = "Recipient email addresses")]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$To,
+
+        [Parameter(Mandatory = $true, HelpMessage = "Email subject")]
+        [ValidateNotNullOrEmpty()]
+        [string]$Subject,
+
+        [Parameter(Mandatory = $true, HelpMessage = "Plain text email body")]
+        [string]$Body,
+
+        [Parameter(Mandatory = $true, HelpMessage = "Path to the report attachment")]
+        [ValidateNotNullOrEmpty()]
+        [string]$AttachmentPath
+    )
+
+    begin {
+        $ErrorActionPreference = 'Stop'
+        [System.Net.Mail.MailMessage]$MailMessage = $null
+        [System.Net.Mail.SmtpClient]$SmtpClient = $null
+        [System.Net.Mail.Attachment]$Attachment = $null
+    }
+
+    process {
+        try {
+            if (-not (Test-Path -LiteralPath $AttachmentPath -PathType Leaf)) {
+                throw "Attachment file not found: $AttachmentPath"
+            }
+
+            $MailMessage = [System.Net.Mail.MailMessage]::new()
+            $MailMessage.From = [System.Net.Mail.MailAddress]::new($From)
+            foreach ($Recipient in $To) {
+                if (-not [string]::IsNullOrWhiteSpace($Recipient)) {
+                    [void]$MailMessage.To.Add($Recipient)
+                }
+            }
+
+            if ($MailMessage.To.Count -eq 0) {
+                throw "At least one recipient address is required."
+            }
+
+            $MailMessage.Subject = $Subject
+            $MailMessage.Body = $Body
+            $MailMessage.IsBodyHtml = $false
+
+            $Attachment = [System.Net.Mail.Attachment]::new($AttachmentPath)
+            [void]$MailMessage.Attachments.Add($Attachment)
+
+            $SmtpClient = [System.Net.Mail.SmtpClient]::new($SmtpServer, $SmtpPort)
+            $SmtpClient.EnableSsl = $false
+            $SmtpClient.UseDefaultCredentials = $false
+            $SmtpClient.DeliveryMethod = [System.Net.Mail.SmtpDeliveryMethod]::Network
+            $SmtpClient.Timeout = 30000
+
+            $SmtpClient.Send($MailMessage)
+            Write-Verbose "Sent report email via SMTP relay '${SmtpServer}:$SmtpPort' to $($MailMessage.To -join ', ')"
+        }
+        catch {
+            throw "Failed to send SMTP report email: $($_.Exception.Message)"
+        }
+        finally {
+            if ($Attachment) { $Attachment.Dispose() }
+            if ($MailMessage) { $MailMessage.Dispose() }
+            if ($SmtpClient) { $SmtpClient.Dispose() }
+        }
     }
 }
 #endregion
@@ -1550,14 +1707,41 @@ Invoke-TboneLog -LogMode Start -Logname $LogName -LogToGUI $LogToGUI -LogToEvent
 try {
     #Sign in to Graph
     try {
+        [string]$ResolvedAuthTenantId = $null
+        [string]$ResolvedAuthClientId = $null
+        [string]$ResolvedAuthClientSecret = $null
+
+        if (-not [string]::IsNullOrWhiteSpace($KeyVaultName)) {
+            Write-Verbose "Key Vault integration enabled with vault '$KeyVaultName'"
+
+            if (-not [string]::IsNullOrWhiteSpace($KeyVaultTenantIdSecretName)) {
+                $ResolvedAuthTenantId = Invoke-GetKeyVaultSecretValue -VaultName $KeyVaultName -SecretName $KeyVaultTenantIdSecretName
+                Write-Verbose "Resolved AuthTenantId from Azure Key Vault"
+            }
+            if (-not [string]::IsNullOrWhiteSpace($KeyVaultClientIdSecretName)) {
+                $ResolvedAuthClientId = Invoke-GetKeyVaultSecretValue -VaultName $KeyVaultName -SecretName $KeyVaultClientIdSecretName
+                Write-Verbose "Resolved AuthClientId from Azure Key Vault"
+            }
+            if (-not [string]::IsNullOrWhiteSpace($KeyVaultClientSecretSecretName)) {
+                $ResolvedAuthClientSecret = Invoke-GetKeyVaultSecretValue -VaultName $KeyVaultName -SecretName $KeyVaultClientSecretSecretName
+                Write-Verbose "Resolved AuthClientSecret from Azure Key Vault"
+            }
+
+            if (
+                [string]::IsNullOrWhiteSpace($ResolvedAuthTenantId) -or
+                [string]::IsNullOrWhiteSpace($ResolvedAuthClientId) -or
+                [string]::IsNullOrWhiteSpace($ResolvedAuthClientSecret)
+            ) {
+                throw "Key Vault authentication requires tenant ID, client ID, and client secret values."
+            }
+        }
+
         # Build authentication parameters to pass only non-empty values. If no values are provided, default interactive auth or managed identity auth will be used.
         [hashtable]$AuthParams = @{}
-        @{AuthTenantId = $AuthTenantId; AuthClientId = $AuthClientId; AuthCertThumbprint = $AuthCertThumbprint; AuthCertName = $AuthCertName; AuthCertPath = $AuthCertPath}.GetEnumerator() `
+        @{AuthTenantId = $ResolvedAuthTenantId; AuthClientId = $ResolvedAuthClientId}.GetEnumerator() `
             | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Value) } `
             | ForEach-Object { $AuthParams[$_.Key] = $_.Value }
-        # Add SecureString parameters that require different null checks
-        if ($AuthClientSecret -and $AuthClientSecret.Length -gt 0) { $AuthParams['AuthClientSecret'] = $AuthClientSecret }
-        if ($AuthCertPassword -and $AuthCertPassword.Length -gt 0) { $AuthParams['AuthCertPassword'] = $AuthCertPassword }
+        if (-not [string]::IsNullOrWhiteSpace($ResolvedAuthClientSecret)) { $AuthParams['AuthClientSecret'] = $ResolvedAuthClientSecret }
         # Invoke connection to Microsoft Graph with specified authentication parameters
         Invoke-ConnectMgGraph @AuthParams -RequiredScopes $RequiredScopes
         Write-Verbose "Success to get Access Token to Graph"
@@ -1971,12 +2155,85 @@ finally { #End Script and restore preferences
     $ErrorActionPreference  = $script:OriginalErrorActionPreference
     $VerbosePreference      = $script:OriginalVerbosePreference
     $WhatIfPreference       = $script:OriginalWhatIfPreference
-    # End T-Bone custom logging
+    # End T-Bone custom logging before report generation so report output reaches the caller's normal stdout stream
     Invoke-TboneLog -LogMode Stop
-    # Generate report if requested
-    if ($ReportEnabled) {
-        Invoke-ScriptReport -ReportTitle $ReportTitle -ReportResults $ReportResults -ReportStartTime $ReportStartTime -ReportDetailed $ReportDetailed -ReportToDisk $ReportToDisk -ReportToDiskPath $ReportToDiskPath
-    } else {Write-Verbose "Report generation not requested"}
+    [object]$GeneratedReport = $null
+    [string[]]$EmailRecipients = @()
+    if (-not [string]::IsNullOrWhiteSpace($EmailTo)) {
+        $EmailRecipients = @(
+            $EmailTo -split '[,;`r`n]+'
+            | ForEach-Object { $_.Trim() }
+            | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+    }
+    $script:LastScriptReport = $null
+    if ($ReportEnabled -or $EmailReportEnabled) {
+        [bool]$PersistReportToDisk = $ReportToDisk -or $EmailReportEnabled
+        [string]$EffectiveReportToDiskPath = if ($PersistReportToDisk -and -not [string]::IsNullOrWhiteSpace($ReportToDiskPath)) {
+            $ReportToDiskPath
+        }
+        elseif ($env:TEMP) {
+            $env:TEMP
+        }
+        else {
+            '/tmp'
+        }
+
+        Invoke-ScriptReport `
+            -ReportTitle $ReportTitle `
+            -ReportResults $ReportResults `
+            -ReportStartTime $ReportStartTime `
+            -ReportDetailed $ReportDetailed `
+            -ReportToDisk $PersistReportToDisk `
+            -ReportToDiskPath $EffectiveReportToDiskPath `
+            -ReportFormat 'CSV' `
+            -ReportEmitOutput $ReportEnabled
+        $GeneratedReport = $script:LastScriptReport
+    }
+    else {
+        Write-Verbose "Report generation not requested"
+    }
+
+    if ($EmailReportEnabled) {
+        [string[]]$MissingEmailSettings = @()
+        if ([string]::IsNullOrWhiteSpace($EmailRelayServer)) { $MissingEmailSettings += 'EmailRelayServer' }
+        if ([string]::IsNullOrWhiteSpace($EmailFrom)) { $MissingEmailSettings += 'EmailFrom' }
+        if ($EmailRecipients.Count -eq 0) { $MissingEmailSettings += 'EmailTo' }
+        if ($null -eq $GeneratedReport) { $MissingEmailSettings += 'GeneratedReport' }
+        if ($null -eq $GeneratedReport.SavedReportPath -or -not (Test-Path -LiteralPath $GeneratedReport.SavedReportPath -PathType Leaf)) { $MissingEmailSettings += 'SavedReportPath' }
+
+        if ($MissingEmailSettings.Count -gt 0) {
+            Write-Warning "Email report enabled but missing required values: $($MissingEmailSettings -join ', '). Skipping email delivery."
+        }
+        else {
+            [string]$ResolvedEmailSubject = if ([string]::IsNullOrWhiteSpace($EmailSubject)) {
+                "$ReportTitle - $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
+            }
+            else {
+                $EmailSubject
+            }
+            [string]$EmailBody = @(
+                $GeneratedReport.SummaryText
+                ""
+                "Full report attached: $(Split-Path -Path $GeneratedReport.SavedReportPath -Leaf)"
+            ) -join [Environment]::NewLine
+
+            try {
+                Invoke-SendSmtpReport `
+                    -SmtpServer $EmailRelayServer `
+                    -SmtpPort $EmailRelayPort `
+                    -From $EmailFrom `
+                    -To $EmailRecipients `
+                    -Subject $ResolvedEmailSubject `
+                    -Body $EmailBody `
+                    -AttachmentPath $GeneratedReport.SavedReportPath
+                Write-Output "Report email sent: $($EmailRecipients -join ', ')"
+            }
+            catch {
+                Write-Warning $_.Exception.Message
+            }
+        }
+    }
     # End script and report memory usage 
     [double]$MemoryUsage = [Math]::Round(([System.GC]::GetTotalMemory($false) / 1MB), 2)
     Write-Verbose "Script finished. Memory usage: $MemoryUsage MB"
