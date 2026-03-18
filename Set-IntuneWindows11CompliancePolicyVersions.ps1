@@ -62,7 +62,7 @@ param(
 
     [Parameter(Mandatory = $false, HelpMessage = "Display name of the Windows 11 dynamic device group.")]
     [ValidateNotNullOrEmpty()]
-    [string]$Windows11GroupName = "Intune Windows 11 Devices",
+    [string]$Windows11GroupName = "Windows 11 Compliance",
 
     [Parameter(Mandatory = $false, HelpMessage = "Optional override for the Windows 11 dynamic membership rule. Leave blank to generate from supported Windows 11 build branches.")]
     [string]$Windows11GroupMembershipRule,
@@ -103,19 +103,19 @@ param(
 
     [Parameter(HelpMessage = "Azure Key Vault name used to retrieve app authentication secrets before connecting to Microsoft Graph")]
     [ValidateNotNullOrEmpty()]
-    [string]$KeyVaultName,
+    [string]$KeyVaultName = 'SharedAutomationKV',
 
     [Parameter(HelpMessage = "Azure Key Vault secret name containing the Entra ID Tenant ID. Default is 'tenantid'")]
     [ValidateNotNullOrEmpty()]
-    [string]$KeyVaultTenantIdSecretName = 'tenantid',
+    [string]$KeyVaultTenantIdSecretName = 'Intune-Automation-SP-tenantid',
 
     [Parameter(HelpMessage = "Azure Key Vault secret name containing the Entra ID Application ID (Client ID). Default is 'clientid'")]
     [ValidateNotNullOrEmpty()]
-    [string]$KeyVaultClientIdSecretName = 'clientid',
+    [string]$KeyVaultClientIdSecretName = 'Intune-Automation-SP-clientid',
 
     [Parameter(HelpMessage = "Azure Key Vault secret name containing the Entra ID Application Secret. Default is 'secret'")]
     [ValidateNotNullOrEmpty()]
-    [string]$KeyVaultClientSecretSecretName = 'secret',
+    [string]$KeyVaultClientSecretSecretName = 'Intune-Automation-SP-secret',
 # ==========> Logging (Invoke-TboneLog) <==============================================================================
     [Parameter(Mandatory = $false, HelpMessage = 'Name of Log, to set name for Eventlog and Filelog')]
     [string]$LogName = "",
